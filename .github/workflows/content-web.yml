@@ -1,0 +1,96 @@
+name: content-web
+
+# This workflow is triggered on push to the 'content-web' directory of the main branch of the repository
+on:
+  push:
+    branches:
+        - main
+    paths:
+        - 'content-web/**'
+
+  workflow_dispatch:
+
+env:
+  chartVersion: 0.1.0
+  appMajorMinorVersion: 0.1
+  imageRepository: 'content-web'
+  containerRegistryName: 'YOUR_ACR'
+  containerRegistry: 'YOUR_ACR.azurecr.io'
+  dockerfilePath: './content-web'
+  tag: '${{ github.run_id  }}'
+  HELM_EXPERIMENTAL_OCI: 1
+
+jobs:
+  build-and-publish-docker-image:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@main
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v1
+
+    - name: Login to ACR
+      uses: docker/login-action@v1
+      with:
+        registry: ${{ env.containerRegistry }}
+        username: ${{ secrets.ACR_USERNAME }}
+        password: ${{ secrets.ACR_PASSWORD }}
+
+    - name: Build and push an image to container registry
+      uses: docker/build-push-action@v2
+      with:
+        context: ${{ env.dockerfilePath  }}
+        file: "${{ env.dockerfilePath }}/Dockerfile"
+        pull: true
+        push: true
+        tags: |
+          ${{ env.containerRegistry }}/${{ env.imageRepository }}:${{ env.tag }}
+          ${{ env.containerRegistry }}/${{ env.imageRepository }}:latest
+
+  build-and-push-helm-chart:
+    name: Build and Push Helm Chart
+    runs-on: ubuntu-latest
+    needs: [build-and-publish-docker-image]
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@main
+
+    - name: Helm Install
+      uses: azure/setup-helm@v1
+
+    - name: Helm Repo Login
+      run: |
+        helm registry login ${{ env.containerRegistry }} --username ${{ secrets.ACR_USERNAME }} --password ${{ secrets.ACR_PASSWORD }}
+
+    - name: Helm Chart Update, Package and Push
+      run: |
+        cd ./content-web/charts/web
+        escaped_version=$(printf '%s\n' "${{ env.chartVersion }}" | sed -e 's/[\/.]/\\./g')
+        sed -i "s/version\: 0\.0\.0/version\: $escaped_version/" Chart.yaml
+        
+        helm package . --app-version ${{ env.appMajorMinorVersion }}.${{ env.tag }}
+        helm push web-${{ env.chartVersion }}.tgz oci://${{ env.containerRegistry }}/helm
+
+  aks-deployment:
+    name: Azure Kubernetes Service - AKS - Deployment
+    runs-on: ubuntu-latest
+    needs: [build-and-publish-docker-image,build-and-push-helm-chart]
+    steps:
+
+    - name: Helm Install
+      uses: azure/setup-helm@v1
+      
+    - name: Helm Repo Login
+      run: |
+        helm registry login ${{ env.containerRegistry }} --username ${{ secrets.ACR_USERNAME }} --password ${{ secrets.ACR_PASSWORD }}
+
+    - name: kubeconfig
+      run: echo "${{ secrets.KUBECONFIG }}" >> kubeconfig
+      
+    - name: Helm Upgrade
+      run: |      
+        helm upgrade web  oci://${{ env.containerRegistry }}/helm/web --install --version ${{ env.chartVersion }}
+        
+      env:
+        KUBECONFIG: './kubeconfig'
